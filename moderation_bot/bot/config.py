@@ -17,6 +17,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 #: Файл базы данных по умолчанию.
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "moderation.sqlite3"
 
+#: Sentinel: «путь к .env не указан» — значит, берём `.env` рядом с проектом.
+_USE_DEFAULT_ENV = object()
+
 
 class ConfigError(RuntimeError):
     """Некорректная конфигурация: понятное сообщение вместо трейсбека."""
@@ -96,28 +99,49 @@ class Config:
         return self.banned_hashtag.strip().lower().replace(" ", "")
 
 
-def load_config(env_file: str | os.PathLike[str] | None = ".env") -> Config:
+def resolve_db_path(raw: str | None = None) -> Path:
+    """Превращает значение ``DB_PATH`` в абсолютный путь.
+
+    Относительный путь считается от каталога `moderation_bot`, а не от текущего
+    каталога процесса: тогда базе всё равно, откуда запущен бот.
+    """
+    value = (raw if raw is not None else os.getenv("DB_PATH", "")).strip()
+    path = Path(value).expanduser() if value else DEFAULT_DB_PATH
+    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+def load_config(env_file: object = _USE_DEFAULT_ENV) -> Config:
     """Загружает `.env` и собирает :class:`Config`.
+
+    Args:
+        env_file: путь к файлу с переменными.
+
+            * не передан — читается `moderation_bot/.env` (не зависит от текущего каталога);
+            * ``None`` — файл не читается вообще, значения берутся только из окружения
+              процесса (используется в тестах);
+            * строка или ``Path`` — читается указанный файл.
 
     Raises:
         ConfigError: если не задан `BOT_TOKEN` (или он не похож на токен BotFather).
     """
+    if env_file is _USE_DEFAULT_ENV:
+        env_file = PROJECT_ROOT / ".env"
     if env_file is not None:
         # override=False: переменные окружения процесса имеют приоритет над файлом.
         load_dotenv(env_file, override=False)
 
     token = (os.getenv("BOT_TOKEN") or "").strip()
     if not token or _looks_like_placeholder(token):
-        raise ConfigError("BOT_TOKEN не задан. Скопируйте .env.example в .env и вставьте токен от @BotFather.")
+        raise ConfigError(
+            f"BOT_TOKEN не задан. Скопируйте .env.example в {PROJECT_ROOT / '.env'} "
+            "и вставьте токен от @BotFather (или задайте переменную окружения BOT_TOKEN)."
+        )
     if ":" not in token or not token.split(":", 1)[0].isdigit():
         raise ConfigError(
             "BOT_TOKEN выглядит некорректно (ожидается формат '123456789:AA...'). Проверьте значение в .env."
         )
 
-    db_path_raw = os.getenv("DB_PATH", "").strip()
-    db_path = Path(db_path_raw).expanduser() if db_path_raw else DEFAULT_DB_PATH
-    if not db_path.is_absolute():
-        db_path = (PROJECT_ROOT / db_path).resolve()
+    db_path = resolve_db_path()
 
     return Config(
         bot_token=token,

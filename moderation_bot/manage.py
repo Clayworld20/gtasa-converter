@@ -8,20 +8,25 @@
     python manage.py set --chat -1001234567890 --flag block_hashtag --value off
     python manage.py doctor --chat -1001234567890
     python manage.py demo
+    python manage.py selftest
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
 from aiogram.types import Message
+from dotenv import load_dotenv
 
-from bot.config import Config, ConfigError, load_config
+from bot.config import PROJECT_ROOT, Config, ConfigError, load_config, resolve_db_path
 from bot.database import SettingsRepository
 from bot.filters import MessageModerator, content_label, reason_label
 from bot.keyboards import flag_title
@@ -29,6 +34,9 @@ from bot.models import TOGGLE_FIELDS, ChatSettings, SettingsDefaults
 from bot.permissions import can_delete_messages
 
 MARKS = {True: "✅ вкл", False: "❌ выкл"}
+OK, WARN, FAIL, INFO = "✅", "⚠️ ", "❌", "ℹ️ "
+#: Допустимый @username в Telegram.
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 ON_VALUES = {"on", "1", "true", "yes", "вкл", "да"}
 OFF_VALUES = {"off", "0", "false", "no", "выкл", "нет"}
 
@@ -163,6 +171,155 @@ async def _cmd_demo(config: Config, chat_id: int | None) -> int:
     return 0
 
 
+async def _cmd_selftest(*, offline: bool = False, delete_webhook: bool = False) -> int:
+    """Проверяет готовность бота к запуску и подсказывает, что осталось сделать.
+
+    Работает даже без токена: сначала проверяет Python, зависимости, `.env`
+    и базу, и только потом (если есть рабочий токен) — связь с Telegram.
+    Возвращает 0, если всё в порядке, и 1, если есть что исправить.
+    """
+    import importlib.metadata as metadata
+
+    print("🔍 Проверка готовности бота к запуску\n")
+    problems: list[str] = []
+    env_path = PROJECT_ROOT / ".env"
+
+    # 1. Версия Python (проверка намеренно в рантайме: пользователь может запустить и на 3.8)
+    version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if sys.version_info >= (3, 10):  # noqa: UP036
+        print(f"{OK} Python {version}")
+    else:
+        problems.append("Нужен Python 3.10 или новее")
+        print(f"{FAIL} Python {version} — нужен 3.10+")
+
+    # 2. Зависимости
+    for package in ("aiogram", "aiosqlite", "python-dotenv"):
+        try:
+            print(f"{OK} {package} {metadata.version(package)}")
+        except metadata.PackageNotFoundError:
+            problems.append(f"Не установлен {package}: pip install -r requirements.txt")
+            print(f"{FAIL} {package} не установлен")
+
+    # 3. Файл .env
+    if env_path.exists():
+        print(f"{OK} Файл настроек: {env_path}")
+    else:
+        problems.append(f"Нет файла {env_path}: выполните `cp .env.example .env` и вставьте токен")
+        print(f"{WARN}Нет файла {env_path} (можно задать переменные окружения вручную)")
+
+    # 4. Токен и значения фильтров
+    load_dotenv(env_path, override=False)
+    config: Config | None = None
+    token_error = ""
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        token_error = str(exc)
+
+    if config is None:
+        problems.append(token_error or "BOT_TOKEN не задан")
+        print(f"{FAIL} BOT_TOKEN: {token_error}")
+    else:
+        print(f"{OK} BOT_TOKEN задан (id бота из токена: {config.bot_token.split(':', 1)[0]})")
+        if USERNAME_RE.match(config.target_username):
+            print(f"{OK} Фильтр по пользователю: @{config.target_username}")
+        else:
+            problems.append(
+                f"TARGET_USERNAME={config.target_username!r} не похож на @username "
+                "(5–32 символа: латиница, цифры, подчёркивание)"
+            )
+            print(f"{WARN}TARGET_USERNAME={config.target_username!r} не похож на @username")
+        print(f"{OK} Фильтр по хэштегу: {config.banned_hashtag}")
+
+        if config.allowed_chat_id is not None:
+            print(f"{OK} Бот ограничен одним чатом: {config.allowed_chat_id}")
+        else:
+            print(f"{INFO} ALLOWED_CHAT_ID не задан — бот будет работать во всех группах, куда его добавят")
+
+    # 5. База данных
+    db_path = resolve_db_path()
+    try:
+        repository = SettingsRepository(db_path)
+        await repository.connect()
+        try:
+            settings = await repository.get(0)  # чтение тестового чата: строка не создаётся
+        finally:
+            await repository.close()
+        print(f"{OK} База данных доступна: {db_path}")
+        defaults_note = (
+            f"{INFO} Значения по умолчанию для новой группы: "
+            f"включено {settings.enabled_count} из {len(TOGGLE_FIELDS)} фильтров"
+        )
+        print(defaults_note)
+    except OSError as exc:
+        problems.append(f"База данных недоступна ({db_path}): {exc}")
+        print(f"{FAIL} База данных недоступна: {exc}")
+
+    # 6. Связь с Telegram
+    if offline:
+        print(f"{INFO} Проверка связи с Telegram пропущена (--offline)")
+    elif config is None:
+        print(f"{INFO} Проверка связи с Telegram пропущена: сначала нужен рабочий токен")
+    else:
+        await _check_telegram(config, problems, delete_webhook=delete_webhook)
+
+    # 7. Итог
+    print()
+    if problems:
+        print("❗ Что осталось сделать:")
+        for number, problem in enumerate(problems, 1):
+            print(f"  {number}. {problem}")
+        return 1
+
+    print("🎉 Всё готово. Запуск: python -m bot")
+    print("   Дальше в Telegram: добавить бота в группу → права админа с «Удалять сообщения» →")
+    print("   @BotFather: /setprivacy → Disable → в группе отправить /settings")
+    return 0
+
+
+async def _check_telegram(config: Config, problems: list[str], *, delete_webhook: bool) -> None:
+    """Проверяет токен, вебхук и (если задан) права бота в конкретном чате."""
+    bot = Bot(token=config.bot_token)
+    try:
+        me = await bot.get_me()
+        print(f"{OK} Telegram принял токен: @{me.username} (id={me.id}) → https://t.me/{me.username}")
+
+        info = await bot.get_webhook_info()
+        if info.url:
+            if delete_webhook:
+                await bot.delete_webhook(drop_pending_updates=False)
+                print(f"{OK} Вебхук {info.url} снят — long polling снова доступен")
+            else:
+                problems.append(
+                    f"У бота установлен вебхук ({info.url}): long polling не запустится. "
+                    "Снимите его командой `python manage.py selftest --delete-webhook`"
+                )
+                print(f"{WARN}Установлен вебхук: {info.url} — бот в режиме long polling не запустится")
+        else:
+            print(f"{OK} Вебхук не установлен (long polling доступен), в очереди {info.pending_update_count} апдейтов")
+
+        if config.allowed_chat_id is not None:
+            if await can_delete_messages(bot, config.allowed_chat_id):
+                print(f"{OK} В чате {config.allowed_chat_id} бот может удалять сообщения")
+            else:
+                problems.append(
+                    f"В чате {config.allowed_chat_id} бот не может удалять сообщения: "
+                    "выдайте права администратора с правом «Удалять сообщения»"
+                )
+                print(f"{FAIL} В чате {config.allowed_chat_id} бот не может удалять сообщения")
+    except TelegramUnauthorizedError:
+        problems.append("Telegram отклонил токен: проверьте BOT_TOKEN (возможно, он отозван в @BotFather)")
+        print(f"{FAIL} Telegram отклонил токен")
+    except TelegramAPIError as exc:
+        problems.append(
+            f"Нет связи с Telegram API ({exc}). Проверьте интернет, прокси или файрвол — "
+            "либо запустите `python manage.py selftest --offline`, чтобы проверить всё остальное"
+        )
+        print(f"{FAIL} Нет связи с Telegram API: {exc}")
+    finally:
+        await bot.session.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Настройки модерации без Telegram")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -182,11 +339,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     demo = sub.add_parser("demo", help="показать, какие сообщения будут удалены (без Telegram)")
     demo.add_argument("--chat", type=int, default=None, help="взять настройки этого чата из базы")
+
+    selftest = sub.add_parser("selftest", help="проверить готовность бота к запуску")
+    selftest.add_argument("--offline", action="store_true", help="не обращаться к Telegram")
+    selftest.add_argument(
+        "--delete-webhook",
+        action="store_true",
+        help="снять установленный вебхук (мешает long polling)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.command == "selftest":
+        # Сам диагностирует конфиг, поэтому запускается и с незаполненным .env.
+        return asyncio.run(_cmd_selftest(offline=args.offline, delete_webhook=args.delete_webhook))
+
     try:
         config = load_config()
     except ConfigError as exc:

@@ -4,7 +4,7 @@ PYTHON ?= python3
 VENV   ?= .venv
 BIN    := $(VENV)/bin
 
-.PHONY: help venv install run test lint format cli demo clean
+.PHONY: help venv install setup run selftest doctor test lint format cli demo clean
 
 help: ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -15,6 +15,16 @@ venv: ## Создать виртуальное окружение
 
 install: venv ## Установить зависимости (включая dev)
 	$(BIN)/pip install -r requirements-dev.txt
+
+setup: install ## Первичная настройка: зависимости + .env + диагностика
+	@test -f .env || (cp .env.example .env && echo "📝 Создан .env — вставьте в него BOT_TOKEN")
+	-$(BIN)/python manage.py selftest --offline
+
+selftest: ## Проверить готовность бота к запуску (добавьте ONLINE=1 для связи с Telegram)
+	$(BIN)/python manage.py selftest $(if $(ONLINE),, --offline)
+
+doctor: ## Проверить права бота в группе: make doctor CHAT=-1001234567890
+	$(BIN)/python manage.py doctor --chat $(CHAT)
 
 run: ## Запустить бота (нужен .env)
 	$(BIN)/python -m bot
