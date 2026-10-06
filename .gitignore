@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Тесты, линтеры, кэши
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Локальные секреты и данные
+.env
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

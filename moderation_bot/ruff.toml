@@ -1,0 +1,14 @@
+line-length = 120
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "ISC", "PT", "RUF"]
+ignore = [
+    "B008",   # вызовы в аргументах по умолчанию — норма для aiogram-фильтров
+    "RUF001", # неоднозначные unicode-символы: в русских текстах это норма
+    "RUF002",
+    "RUF003",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002", "PT011"]
